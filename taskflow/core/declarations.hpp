@@ -18,6 +18,7 @@ class Taskflow;
 class Topology;
 class TopologyBase;
 class Executor;
+class TaskArena;
 class Worker;
 class WorkerView;
 class ObserverInterface;

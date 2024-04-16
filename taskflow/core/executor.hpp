@@ -3,6 +3,8 @@
 #include "observer.hpp"
 #include "taskflow.hpp"
 #include "async_task.hpp"
+#include <shared_mutex>
+//#include "task_arena.hpp"
 
 /**
 @file executor.hpp
@@ -588,6 +590,9 @@ class Executor {
   */
   size_t num_observers() const noexcept;
 
+  template <typename Callable>
+  void isolate(TaskArena& h, Callable&& c);
+
   // --------------------------------------------------------------------------
   // Async Task Methods
   // --------------------------------------------------------------------------
@@ -1037,6 +1042,7 @@ class Executor {
   
   std::mutex _wsq_mutex;
   std::mutex _taskflows_mutex;
+  std::shared_mutex _workersMutex;
 
 #ifdef __cpp_lib_atomic_wait
   std::atomic<size_t> _num_topologies {0};
@@ -1098,6 +1104,21 @@ class Executor {
   
   template <typename P>
   void _corun_until(Worker&, P&&);
+};
+
+class TaskArena {
+    friend class Executor;
+public:
+    TaskArena(Executor& e, int id) {
+        _wsq_per_worker_id = std::vector<TaskQueue<Node*>>(e.num_workers());
+        _previous_task_arenas = std::vector<std::shared_ptr<TaskArena>>(e.num_workers());
+        _id = id;
+    }
+
+private:
+    std::vector<std::shared_ptr<TaskArena>> _previous_task_arenas;
+    std::vector<TaskQueue<Node*>> _wsq_per_worker_id;
+    int _id;
 };
 
 // Constructor
@@ -1180,6 +1201,7 @@ inline void Executor::_spawn(size_t N) {
 
     _workers[id]._id = id;
     _workers[id]._vtm = id;
+    _workers[id]._arena_vtm = -1;
     _workers[id]._executor = this;
     _workers[id]._waiter = &_notifier._waiters[id];
 
@@ -1252,17 +1274,43 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
   while(!stop_predicate()) {
 
     //exploit:
-
-    if(auto t = w._wsq.pop(); t) {
+      Node* t;
+      {
+          std::shared_lock<std::shared_mutex> lock(_workersMutex);
+          t = w._task_arena_ptr.get() == nullptr ? w._wsq.pop() : w._task_arena_ptr->_wsq_per_worker_id[w._id].pop();
+      }
+    if(t) {
       _invoke(w, t);
     }
     else {
       size_t num_steals = 0;
-
       explore:
-
-      t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]._wsq.steal();
-
+      {
+        std::shared_lock<std::shared_mutex> lock(_workersMutex);
+        if (w._id == w._vtm) {
+            t = _wsq.steal();
+        }
+        else if (w._task_arena_ptr.get() == nullptr) {
+          t = _workers[w._vtm]._wsq.steal();
+          if (t == nullptr && _workers[w._vtm]._task_arena_ptr.get() != nullptr && !_workers[w._vtm]._task_arena_ptr->_wsq_per_worker_id.empty()) {
+            auto current_task_arena = _workers[w._vtm]._task_arena_ptr;
+            while (t == nullptr && current_task_arena.get() != nullptr) {
+              t = current_task_arena->_wsq_per_worker_id[w._vtm].steal();
+              if (t == nullptr)
+                current_task_arena = current_task_arena->_previous_task_arenas[w._vtm];
+            }
+            if (t != nullptr) {
+              w._task_arena_ptr = current_task_arena;
+              w._arena_vtm = w._vtm;
+            }
+          }
+        }
+        else {
+          //if (!w._task_arena_ptr->_wsq_per_worker_id.empty()) // task arena object is destroyed??
+            t = w._task_arena_ptr->_wsq_per_worker_id[w._vtm].steal();
+        }
+      }
+      
       if(t) {
         _invoke(w, t);
         goto exploit;
@@ -1270,6 +1318,7 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
       else if(!stop_predicate()) {
         if(num_steals++ > _MAX_STEALS) {
           std::this_thread::yield();
+
         }
         w._vtm = rdvtm(w._rdgen);
         goto explore;
@@ -1295,7 +1344,32 @@ inline void Executor::_explore_task(Worker& w, Node*& t) {
   // Here, we write do-while to make the worker steal at once
   // from the assigned victim.
   do {
-    t = (w._id == w._vtm) ? _wsq.steal() : _workers[w._vtm]._wsq.steal();
+      {
+        std::shared_lock<std::shared_mutex> lock(_workersMutex);
+        if (w._id == w._vtm) {
+          t = _wsq.steal();
+        }
+        else if (w._task_arena_ptr.get() == nullptr) {
+          t = _workers[w._vtm]._wsq.steal();
+
+          if (t == nullptr && _workers[w._vtm]._task_arena_ptr.get() != nullptr && !_workers[w._vtm]._task_arena_ptr->_wsq_per_worker_id.empty()) {
+            auto current_task_arena = _workers[w._vtm]._task_arena_ptr;
+            while (t == nullptr && current_task_arena.get() != nullptr) {
+              t = current_task_arena->_wsq_per_worker_id[w._vtm].steal();
+              if (t == nullptr && !current_task_arena->_previous_task_arenas.empty())
+                current_task_arena = current_task_arena->_previous_task_arenas[w._vtm];
+            }
+            if (t != nullptr) {
+              w._task_arena_ptr = current_task_arena;
+              w._arena_vtm = w._vtm;
+            }
+          }
+        }
+        else {
+            if (!w._task_arena_ptr->_wsq_per_worker_id.empty()) // task arena object is destroyed??
+                t = w._task_arena_ptr->_wsq_per_worker_id[w._vtm].steal();
+        }
+      }
 
     if(t) {
       break;
@@ -1416,7 +1490,10 @@ inline void Executor::_schedule(Worker& worker, Node* node) {
   // any complicated notification mechanism as the experimental result
   // has shown no significant advantage.
   if(worker._executor == this) {
-    worker._wsq.push(node, p);
+      if (worker._task_arena_ptr.get() == nullptr) // HERE
+          worker._wsq.push(node, p);
+      else
+          worker._task_arena_ptr->_wsq_per_worker_id[worker._id].push(node, p);
     _notifier.notify(false);
     return;
   }
@@ -1468,7 +1545,10 @@ inline void Executor::_schedule(Worker& worker, const SmallVector<Node*>& nodes)
       // void data race.
       auto p = nodes[i]->_priority;
       nodes[i]->_state.fetch_or(Node::READY, std::memory_order_release);
-      worker._wsq.push(nodes[i], p);
+      if (worker._task_arena_ptr.get() == nullptr) // HERE
+          worker._wsq.push(nodes[i], p);
+      else
+          worker._task_arena_ptr->_wsq_per_worker_id[worker.id()].push(nodes[i], p);
       _notifier.notify(false);
     }
     return;
@@ -2223,6 +2303,33 @@ inline void Executor::_tear_down_topology(Worker& worker, Topology* tpg) {
   }
 }
 
+template <typename Callable>
+void Executor::isolate(TaskArena& h, Callable&& c) {
+    auto w = _this_worker();
+    std::shared_ptr<TaskArena> previous_task_arena_ptr = w->_task_arena_ptr;
+    if (previous_task_arena_ptr.get() != nullptr)
+        h._previous_task_arenas[w->_id] = previous_task_arena_ptr;
+    w->_task_arena_ptr = std::shared_ptr<TaskArena>(&h, [](TaskArena*) {});
+    //w->_task_arena_ptr = &h;
+    c();
+    w->_task_arena_ptr = previous_task_arena_ptr;
+        
+    
+    for (auto& worker : _workers)
+    {
+        std::unique_lock<std::shared_mutex> lock(_workersMutex);
+        if (worker._arena_vtm == w->_id)
+        {
+            worker._task_arena_ptr = h._previous_task_arenas[worker._arena_vtm];
+            if (h._previous_task_arenas[worker._arena_vtm].get() == nullptr)
+                worker._arena_vtm = -1;
+        }
+    }
+}
+
+
+
+
 // ############################################################################
 // Forward Declaration: Subflow
 // ############################################################################
@@ -2386,8 +2493,8 @@ auto Runtime::async(P&& params, F&& f) {
 }
 
 
-
 }  // end of namespace tf -----------------------------------------------------
+
 
 
 

@@ -14,7 +14,6 @@ namespace tf {
 // ----------------------------------------------------------------------------
 // Class Definition: Worker
 // ----------------------------------------------------------------------------
-
 /**
 @class Worker
 
@@ -29,6 +28,7 @@ class Worker {
 
   friend class Executor;
   friend class WorkerView;
+  
 
   public:
 
@@ -61,12 +61,15 @@ class Worker {
 
     size_t _id;
     size_t _vtm;
+    size_t _arena_vtm;
     Executor* _executor;
     std::thread* _thread;
     Notifier::Waiter* _waiter;
     std::default_random_engine _rdgen { std::random_device{}() };
     TaskQueue<Node*> _wsq;
     Node* _cache;
+    std::shared_ptr<TaskArena> _task_arena_ptr;
+    
 };
 
 // ----------------------------------------------------------------------------
