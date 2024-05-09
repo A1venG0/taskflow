@@ -3,6 +3,7 @@
 #
 # To enable thread sanitizer: 
 # -DCMAKE_CXX_FLAGS="-fsanitize=thread -g"
+set(CMAKE_CXX_FLAGS "-fsanitize=thread -g")
 #
 # To enable address and leak sanitizers
 # -DCMAKE_CXX_FLAGS="-fsanitize=address  -fsanitize=leak -g"

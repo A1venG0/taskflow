@@ -61,7 +61,6 @@ class Worker {
 
     size_t _id;
     size_t _vtm;
-    size_t _arena_vtm;
     Executor* _executor;
     std::thread* _thread;
     Notifier::Waiter* _waiter;
