@@ -44,10 +44,10 @@ void for_each_index(int N) {
 // Function: main
 int main(int argc, char* argv[]) {
 
-  /*if(argc != 2) {
+  if(argc != 2) {
     std::cerr << "Usage: ./parallel_for num_iterations" << std::endl;
     std::exit(EXIT_FAILURE);
-  }*/
+  }
 
   for_each(std::atoi(argv[1]));
   for_each_index(std::atoi(argv[1]));
